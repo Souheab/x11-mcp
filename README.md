@@ -16,6 +16,52 @@ The server is intended for isolated agent desktops such as Xvfb or Xephyr. An X1
 
 MIT-SHM capture, XDamage-driven settling, Composite off-screen capture, cursor compositing, AT-SPI, HTTP transport, and composite action batches are deliberately deferred.
 
+## Install on NixOS
+
+For a flake-based NixOS configuration, add `x11-mcp` to your inputs and pass the inputs to your NixOS modules:
+
+```nix
+{
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+
+    x11-mcp = {
+      url = "github:Souheab/x11-mcp";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+  };
+
+  outputs = inputs@{ nixpkgs, ... }: {
+    nixosConfigurations.your-hostname = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      specialArgs = { inherit inputs; };
+      modules = [ ./configuration.nix ];
+    };
+  };
+}
+```
+
+Then add the package to `configuration.nix`:
+
+```nix
+{ inputs, pkgs, ... }:
+
+{
+  environment.systemPackages = [
+    inputs.x11-mcp.packages.${pkgs.stdenv.hostPlatform.system}.default
+  ];
+}
+```
+
+Replace `your-hostname` with the name of your NixOS configuration, then apply it:
+
+```console
+sudo nixos-rebuild switch --flake .#your-hostname
+x11-mcp --help
+```
+
+The package supports `x86_64-linux` and `aarch64-linux`. Installing it makes the server binary available system-wide; an X11 display still needs to be configured when the server is launched, as described below.
+
 ## Build and development
 
 ```console
