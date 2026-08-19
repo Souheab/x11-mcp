@@ -1,20 +1,22 @@
 # x11-mcp
 
-`x11-mcp` is a display-scoped MCP stdio server for observing and controlling an X11 desktop. It speaks the X11 protocol directly through `x11rb`; it does not shell out to `xdotool`, `wmctrl`, or screenshot utilities.
+`x11-mcp` is a display-scoped MCP stdio server for observing and controlling an X11 desktop. It speaks X11 directly through `x11rb` and can optionally use AT-SPI for semantic UI inspection and actions. It does not shell out to `xdotool`, `wmctrl`, or screenshot utilities.
 
 The server is intended for isolated agent desktops such as Xvfb or Xephyr. An X11 client can observe every window on a display and synthesize input, so a dedicated display is the meaningful security boundary.
 
-## Features
+## v0.2 features
 
 - Full-desktop, visible-window, and region PNG observations with window and pointer metadata.
+- XDamage-driven change detection, quiet-period settling, and rectangular PNG frame deltas. A 64-frame history protects actions from stale visual state.
 - EWMH window discovery, stable session window references, focus, move, resize, minimize, maximize, restore, and close.
-- XTEST pointer movement, clicks, drags, scrolling, key chords, and text entry.
-- Unicode text insertion through X11 clipboard ownership with best-effort restoration.
-- Polling-based change/idle/window/focus waits and settled observations after actions.
+- XTEST pointer movement, guarded clicks and drags, scrolling, key chords, and text entry.
+- Fail-fast batches of up to 64 X11, semantic, and wait steps under one mutation lock and deadline.
+- Event-driven frame, window, and optional AT-SPI element waits.
+- Optional AT-SPI snapshots and actions with stable element references, generation guards, bounded traversal, text/value support, and X11 window association.
 - Window-class action allowlists, input rate limiting, host-display refusal, and a latched emergency stop.
-- MCP 2025-11-25-compatible structured tool output plus PNG image content over stdio.
+- MCP 2025-11-25-compatible structured output plus one or more PNG image content blocks over stdio.
 
-MIT-SHM capture, XDamage-driven settling, Composite off-screen capture, cursor compositing, AT-SPI, HTTP transport, and composite action batches are deliberately deferred.
+OCR, template matching, HTTP transport, XComposite off-screen capture, MIT-SHM, and advanced clipboard operations are outside the v0.2 scope.
 
 ## Install on NixOS
 
@@ -53,50 +55,47 @@ Then add the package to `configuration.nix`:
 }
 ```
 
-Replace `your-hostname` with the name of your NixOS configuration, then apply it:
+Apply it and inspect the CLI:
 
 ```console
 sudo nixos-rebuild switch --flake .#your-hostname
 x11-mcp --help
 ```
 
-The package supports `x86_64-linux` and `aarch64-linux`. Installing it makes the server binary available system-wide; an X11 display still needs to be configured when the server is launched, as described below.
+The package supports `x86_64-linux` and `aarch64-linux`.
 
 ## Build and development
 
 ```console
-nix build
 nix develop
-cargo test
+cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 nix flake check
 ```
 
-The flake exports `packages.default`, `apps.default`, `devShells.default`, and package checks on `x86_64-linux` and `aarch64-linux`. Its test phase starts an isolated 800x600 Xvfb display and Openbox session.
+The Nix check starts an isolated D-Bus session, 800x600 Xvfb display, Openbox, an AT-SPI bus, and a deterministic Zenity dialog. The development and check inputs include D-Bus, `at-spi2-core`, and Zenity.
 
 ## Start an isolated display
 
 ```console
 Xvfb :20 -screen 0 1920x1080x24 -nolisten tcp &
 DISPLAY=:20 openbox &
-nix run . -- --display :20
+DISPLAY=:20 x11-mcp --display :20
 ```
 
-For a nested visible desktop, use Xephyr instead:
+For semantic control, run the server and applications in a desktop session with an AT-SPI bus. `--accessibility` accepts:
 
-```console
-Xephyr :20 -screen 1280x800 -nolisten tcp &
-DISPLAY=:20 openbox &
-nix run . -- --display :20
-```
+- `auto` (default): startup succeeds without AT-SPI, capabilities report `available: false`, and the next semantic request retries once.
+- `disabled`: semantic tools return `unsupported_capability` without trying to connect.
+- `required`: startup fails unless AT-SPI connects.
 
-`--display` is always required. If the requested display is the inherited `DISPLAY`, or is `:0` when there is no inherited display, startup fails unless `--allow-host-display` is explicitly supplied.
+`--display` is required. If the requested display is the inherited `DISPLAY`, or is `:0` when there is no inherited display, startup fails unless `--allow-host-display` is explicitly supplied.
 
 Use normal Xauthority credentials. `--xauthority /path/to/Xauthority` overrides `XAUTHORITY`; otherwise `x11rb` performs standard Xauthority lookup. Never use `xhost +`.
 
 ## MCP client configuration
 
-Configure an MCP client to launch the binary and pass its arguments separately. A generic configuration for a local checkout looks like:
+A generic configuration for a local checkout is:
 
 ```json
 {
@@ -108,7 +107,9 @@ Configure an MCP client to launch the binary and pass its arguments separately. 
         "/absolute/path/to/x11-mcp",
         "--",
         "--display",
-        ":20"
+        ":20",
+        "--accessibility",
+        "auto"
       ],
       "env": {
         "XAUTHORITY": "/path/to/Xauthority"
@@ -122,6 +123,8 @@ All logs go to stderr. Stdout contains only MCP protocol messages.
 
 ## Tools
 
+v0.2 exposes 15 focused tools:
+
 - `x11.get_capabilities`
 - `x11.observe`
 - `x11.list_windows`
@@ -134,33 +137,220 @@ All logs go to stderr. Stdout contains only MCP protocol messages.
 - `x11.type_text`
 - `x11.window_action`
 - `x11.wait_for`
+- `x11.batch`
+- `x11.accessibility_snapshot`
+- `x11.accessibility_action`
 
-Positions use a tagged `coordinate_space` of `screen`, `window`, or `window_relative`. Window-relative coordinates are normalized from `0.0` through `1.0` and are resolved immediately before the action.
+The MCP `tools/list` response is the authoritative JSON Schema for every request.
 
-Mutating tools accept `observe_after` where applicable:
+## Observations and deltas
+
+Observation targets are tagged objects: `desktop`, `window`, or `region`. Full delivery is the default:
 
 ```json
 {
-  "position": {
-    "coordinate_space": "screen",
-    "x": 400,
-    "y": 300
-  },
+  "target": { "type": "window", "window_ref": "window-3" },
+  "include_windows": true,
+  "delivery": { "mode": "full" }
+}
+```
+
+Request a delta from a prior compatible frame:
+
+```json
+{
+  "target": { "type": "desktop" },
+  "delivery": { "mode": "delta", "since_frame_id": 42 }
+}
+```
+
+A delta result contains `base_frame_id`, `complete`, and `patches`. Each patch has screen-space `bounds` and an `image_index`, where zero identifies the first MCP image content block, one the second, and so on. No visual change returns an empty patch list and no image blocks.
+
+The server returns a complete full frame when the target bounds or desktop topology changed, more than 16 coalesced patches remain, or patch area reaches 60% of the target. An expired or target-incompatible base returns retryable `stale_frame`. Without XDamage, the fallback compares full-frame signatures and returns either an empty delta or a full frame.
+
+`observe_after` now selects its own target and delivery. For `delivery: "delta"`, the action or batch start frame is the base:
+
+```json
+{
+  "quiet_ms": 150,
+  "timeout_ms": 3000,
+  "require_change": true,
+  "target": { "type": "region", "x": 100, "y": 100, "width": 640, "height": 480 },
+  "include_windows": false,
+  "delivery": "delta"
+}
+```
+
+An action is not reported as failed merely because settling timed out; its result has `settled: false` and the final observation. Explicit waits still return retryable timeout errors.
+
+## State guards
+
+Every mutating request accepts a `guard`:
+
+```json
+{
+  "frame_id": 42,
+  "accessibility_generation": 17,
+  "expected_active_window": "window-3"
+}
+```
+
+A matching `frame_id` is mandatory for clicks, drags, positioned scrolling, and window-coordinate pointer actions. The referenced observation must still be in the 64-frame history, cover the action point, have compatible bounds/topology, and have no intersecting damage. Keyboard-only and direct window-reference operations may omit it.
+
+Semantic element mutations require `accessibility_generation` from the snapshot that produced the `element_ref`. `expected_active_window` is optional for either mutation family. Stale pixels, topology, elements, semantic generations, or focus fail before mutation with a retryable `precondition_failed` or `stale_element` result and current state details where safe.
+
+A guarded click typically follows this pattern:
+
+```json
+{
+  "position": { "coordinate_space": "screen", "x": 400, "y": 300 },
   "button": 1,
   "count": 1,
-  "observe_after": {
-    "quiet_ms": 150,
-    "timeout_ms": 3000,
-    "require_change": false
+  "guard": {
+    "frame_id": 42,
+    "expected_active_window": "window-3"
   }
 }
 ```
 
-An action is never reported as failed merely because settling timed out. Its result contains the latest observation with `settled: false`. Explicit wait timeouts are returned as retryable tool errors.
+## Batches
+
+`x11.batch` executes 1–64 tagged steps under the same session mutation lock used by standalone mutations. It is fail-fast, has no rollback, respects one 1–60 second deadline, and releases held keys/buttons on every exit. A failure includes the failed zero-based step index and completed step results.
+
+```json
+{
+  "guard": {
+    "frame_id": 42,
+    "accessibility_generation": 17,
+    "expected_active_window": "window-3"
+  },
+  "timeout_ms": 8000,
+  "steps": [
+    {
+      "step": "click",
+      "request": {
+        "position": { "coordinate_space": "screen", "x": 400, "y": 300 },
+        "button": 1,
+        "count": 1
+      }
+    },
+    {
+      "step": "wait_for",
+      "request": {
+        "condition": {
+          "condition": "window_state",
+          "window_ref": "window-3",
+          "title_contains": "Ready"
+        },
+        "timeout_ms": 4000,
+        "observe": false
+      }
+    }
+  ],
+  "observe_after": {
+    "delivery": "delta",
+    "quiet_ms": 150,
+    "timeout_ms": 2000
+  }
+}
+```
+
+Step request guards and step-level `observe_after` values are replaced by the one batch guard and final observation.
+
+## Waits
+
+`x11.wait_for` uses the tagged `condition` variants:
+
+- `frame_changed` with optional `since_frame_id` and desktop/window/region target.
+- `frame_idle` with `quiet_ms` and target.
+- `window_matched` with a window selector.
+- `window_state` with mapped, active, and title constraints.
+- `window_closed`.
+- `element_matched` with an element selector.
+- `element_state` with required states, name/text matching, and optional numeric `minimum`/`maximum`.
+
+XDamage and AT-SPI events wake relevant waits. Bounded 50 ms polling is retained only when the corresponding event capability is unavailable.
+
+## Accessibility
+
+A snapshot root can be the desktop, a `window_ref`, or an `element_ref`. The result is a flat node list linked by `element_ref` and `parent_ref`. Nodes include role, name, description, states, screen bounds, associated X11 window when unambiguous, interfaces, actions, optional text, and optional numeric value metadata.
+
+Defaults are depth 8, 500 nodes, and no text. Limits are depth 32, 2,000 nodes, and 4,096 text characters per node. `truncated: true` reports a depth or node limit.
+
+```json
+{
+  "root": { "type": "window", "window_ref": "window-3" },
+  "selector": {
+    "role": "push button",
+    "name_contains": "Save",
+    "states_all": ["enabled"],
+    "action": "click"
+  },
+  "max_depth": 12,
+  "max_nodes": 800,
+  "include_text": false
+}
+```
+
+Semantic actions invoke the default or a named action, focus an element, replace editable text, or set a numeric value:
+
+```json
+{
+  "element_ref": "e27",
+  "action": "invoke",
+  "name": "click",
+  "guard": { "accessibility_generation": 17 }
+}
+```
+
+X11 windows are associated primarily by process ID and verified by overlapping screen extents. Ambiguous nodes omit `window_ref`. When a window-class allowlist is active, a semantic mutation is denied unless its element resolves unambiguously to an allowed window. Semantic snapshots remain unrestricted, like screenshots.
+
+## v0.1 to v0.2 migration
+
+v0.2 intentionally permits request/result schema breaks:
+
+- Expect 15 tools instead of 12; add support for batch and semantic tools.
+- Replace the old wait enum with the `frame_changed`, `frame_idle`, `window_matched`, `window_state`, `window_closed`, `element_matched`, and `element_state` condition tags.
+- Add `guard.frame_id` to every targeted pointer mutation. Re-observe and retry on `precondition_failed` or `stale_frame`.
+- Read observation metadata directly from the structured result and consume `patches[*].image_index` instead of assuming exactly one image.
+- Set `delivery` explicitly when requesting deltas. Treat `complete: true` as a replacement frame and an empty patch list as no change.
+- Extend `observe_after` with `target`, `include_windows`, and `delivery`; omitted fields retain full-desktop/full-frame behavior.
+- Pass `--accessibility disabled` if the deployment must never connect to AT-SPI, or `required` if semantic availability is mandatory.
+
+Old click:
+
+```json
+{
+  "position": { "coordinate_space": "screen", "x": 400, "y": 300 }
+}
+```
+
+v0.2 click after observing frame 42:
+
+```json
+{
+  "position": { "coordinate_space": "screen", "x": 400, "y": 300 },
+  "guard": { "frame_id": 42 }
+}
+```
+
+Old wait intent “wait for any visual change” becomes:
+
+```json
+{
+  "condition": {
+    "condition": "frame_changed",
+    "since_frame_id": 42,
+    "target": { "type": "desktop" }
+  },
+  "timeout_ms": 3000,
+  "observe": true
+}
+```
 
 ## Safety controls
 
-Repeat `--allow-window-class 'glob'` to restrict targeted actions. Screen-coordinate actions must resolve to a topmost window whose `WM_CLASS` instance or class matches one of those globs. This does not hide other windows from full-desktop observations.
+Repeat `--allow-window-class 'glob'` to restrict targeted actions. Screen-coordinate actions must resolve to a topmost window whose `WM_CLASS` instance or class matches one of those globs. This does not hide other windows from observations or semantic snapshots.
 
 The default input burst limit is 200 XTEST events per second. Override it with `--max-input-events-per-second`.
 
@@ -170,7 +360,7 @@ Send `SIGUSR1` to latch the emergency stop:
 kill -USR1 "$(pgrep -n x11-mcp)"
 ```
 
-Observation tools remain available, but all subsequent mutations fail until the process is restarted. SIGINT or terminating the MCP client shuts the server down and releases any held synthetic keys or buttons.
+Observation tools remain available, but all subsequent mutations fail until the process is restarted. SIGINT or terminating the MCP client shuts the server down and releases held synthetic keys or buttons.
 
 ## License
 

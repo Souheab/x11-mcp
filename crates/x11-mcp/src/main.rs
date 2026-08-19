@@ -1,5 +1,6 @@
 mod safety;
 mod server;
+mod session;
 
 use std::{
     path::PathBuf,
@@ -10,13 +11,31 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use clap::Parser;
+use atspi_controller::AccessibilityMode;
+use clap::{Parser, ValueEnum};
 use rmcp::{ServiceExt as _, transport::stdio};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 use x11_controller::{ControllerConfig, DesktopController};
 
-use crate::{safety::validate_target_display, server::X11McpServer};
+use crate::{safety::validate_target_display, server::X11McpServer, session::DesktopSession};
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum AccessibilityModeArg {
+    Auto,
+    Disabled,
+    Required,
+}
+
+impl From<AccessibilityModeArg> for AccessibilityMode {
+    fn from(value: AccessibilityModeArg) -> Self {
+        match value {
+            AccessibilityModeArg::Auto => Self::Auto,
+            AccessibilityModeArg::Disabled => Self::Disabled,
+            AccessibilityModeArg::Required => Self::Required,
+        }
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -47,6 +66,10 @@ struct Cli {
     /// Key chord used by clipboard text insertion.
     #[arg(long, default_value = "CTRL+V")]
     paste_chord: String,
+
+    /// AT-SPI availability policy.
+    #[arg(long, value_enum, default_value = "auto")]
+    accessibility: AccessibilityModeArg,
 
     /// stderr tracing filter.
     #[arg(
@@ -118,7 +141,12 @@ async fn run(cli: Cli) -> Result<()> {
     let controller: Arc<dyn DesktopController> = Arc::new(controller);
     let capabilities = controller.capabilities().await?;
     info!(display = %capabilities.display, "connected to X11 display; starting MCP stdio");
-    let service = X11McpServer::new(controller)
+    let session = Arc::new(
+        DesktopSession::new(controller, cli.accessibility.into())
+            .await
+            .map_err(anyhow::Error::msg)?,
+    );
+    let service = X11McpServer::new(session)
         .serve(stdio())
         .await
         .context("start MCP stdio service")?;

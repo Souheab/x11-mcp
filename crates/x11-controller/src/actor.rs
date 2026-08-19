@@ -5,6 +5,7 @@
 )]
 
 use std::{
+    cell::Cell,
     collections::{HashMap, HashSet, VecDeque},
     sync::{
         Arc,
@@ -17,6 +18,7 @@ use std::{
 
 use async_trait::async_trait;
 use globset::{Glob, GlobMatcher};
+use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use tokio::sync::oneshot;
 use tracing::{debug, warn};
 use x11rb::{
@@ -24,6 +26,7 @@ use x11rb::{
     connection::Connection,
     protocol::{
         Event,
+        damage::{ConnectionExt as _, ReportLevel},
         randr::ConnectionExt as _,
         xproto::{
             Atom, AtomEnum, ChangeWindowAttributesAux, ClientMessageData, ClientMessageEvent,
@@ -39,12 +42,13 @@ use x11rb::{
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::{
-    ActionResult, Capabilities, ClickRequest, ControllerConfig, ControllerError, DesktopController,
-    DragRequest, ErrorCode, FocusWindowRequest, Geometry, KeyMode, KeyRequest, ListWindowsRequest,
-    MonitorInfo, MovePointerRequest, Observation, ObservationMetadata, ObserveAfter,
-    ObserveRequest, ObserveTarget, PointerInfo, Position, Result, ScreenInfo, ScrollRequest,
-    SecurityInfo, TextMethod, TypeTextRequest, WaitCondition, WaitRequest, WaitResult,
-    WindowAction, WindowActionRequest, WindowClass, WindowInfo, WindowList,
+    ActionResult, AfterDelivery, Capabilities, ClickRequest, ControllerConfig, ControllerError,
+    DesktopController, DragRequest, ErrorCode, FocusWindowRequest, Geometry, ImagePatch, KeyMode,
+    KeyRequest, ListWindowsRequest, MonitorInfo, MovePointerRequest, Observation,
+    ObservationDelivery, ObservationMetadata, ObserveAfter, ObserveRequest, ObserveTarget,
+    PointerInfo, Position, Result, ScreenInfo, ScrollRequest, SecurityInfo, StateGuard, TextMethod,
+    TypeTextRequest, WaitCondition, WaitRequest, WaitResult, WindowAction, WindowActionRequest,
+    WindowClass, WindowInfo, WindowList,
     capture::{PixelFormat, convert_to_rgb, encode_png},
     keyboard::{KeyStroke, KeyboardMap},
 };
@@ -78,6 +82,32 @@ x11rb::atom_manager! {
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const CLIPBOARD_TIMEOUT: Duration = Duration::from_secs(1);
 const FRAME_HISTORY_SIZE: usize = 64;
+const DAMAGE_HISTORY_SIZE: usize = 1_024;
+const MAX_DELTA_PATCHES: usize = 16;
+const FULL_FRAME_AREA_PERCENT: u64 = 60;
+
+#[derive(Debug, Clone)]
+struct FrameRecord {
+    frame_id: u64,
+    target: ObserveTarget,
+    bounds: Geometry,
+    desktop_generation: u64,
+    signature: u64,
+    damage_sequence: u64,
+}
+
+#[derive(Debug)]
+struct ActionBaseline {
+    observation: Option<Observation>,
+    damage_sequence: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DamageRecord {
+    sequence: u64,
+    bounds: Geometry,
+    topology: bool,
+}
 const BUTTON_PRESS: u8 = 4;
 const BUTTON_RELEASE: u8 = 5;
 const MOTION_NOTIFY: u8 = 6;
@@ -112,6 +142,14 @@ impl ControllerHandle {
             ControllerError::new(ErrorCode::Internal, "X11 actor failed to start")
         })??;
         Ok(Self { sender })
+    }
+
+    #[doc(hidden)]
+    pub async fn capture_count(&self) -> Result<u64> {
+        match self.request(Operation::CaptureCount).await? {
+            Response::U64(value) => Ok(value),
+            _ => Err(unexpected_response()),
+        }
     }
 
     async fn request(&self, operation: Operation) -> Result<Response> {
@@ -189,6 +227,44 @@ impl DesktopController for ControllerHandle {
             _ => Err(unexpected_response()),
         }
     }
+
+    async fn validate_state_guard(
+        &self,
+        guard: StateGuard,
+        require_frame: bool,
+        include_current_pointer: bool,
+        positions: Vec<Position>,
+    ) -> Result<()> {
+        match self
+            .request(Operation::ValidateStateGuard {
+                guard,
+                require_frame,
+                include_current_pointer,
+                positions,
+            })
+            .await?
+        {
+            Response::Unit => Ok(()),
+            _ => Err(unexpected_response()),
+        }
+    }
+
+    async fn validate_window_allowed(&self, window_ref: String) -> Result<()> {
+        match self
+            .request(Operation::ValidateWindowAllowed(window_ref))
+            .await?
+        {
+            Response::Unit => Ok(()),
+            _ => Err(unexpected_response()),
+        }
+    }
+
+    async fn release_input(&self) -> Result<()> {
+        match self.request(Operation::ReleaseInput).await? {
+            Response::Unit => Ok(()),
+            _ => Err(unexpected_response()),
+        }
+    }
 }
 
 impl ControllerHandle {
@@ -225,6 +301,15 @@ enum Operation {
     TypeText(TypeTextRequest),
     WindowAction(WindowActionRequest),
     Wait(WaitRequest),
+    ValidateStateGuard {
+        guard: StateGuard,
+        require_frame: bool,
+        include_current_pointer: bool,
+        positions: Vec<Position>,
+    },
+    ValidateWindowAllowed(String),
+    ReleaseInput,
+    CaptureCount,
 }
 
 enum Response {
@@ -233,6 +318,8 @@ enum Response {
     Windows(WindowList),
     Action(ActionResult),
     Wait(WaitResult),
+    Unit,
+    U64(u64),
 }
 
 struct Actor {
@@ -246,16 +333,21 @@ struct Actor {
     emergency_stop: Arc<AtomicBool>,
     rate_limiter: RateLimiter,
     window_refs: HashMap<Window, String>,
+    observed_windows: HashSet<Window>,
     ref_xids: HashMap<String, Window>,
     next_window_ref: u64,
     frame_id: u64,
     desktop_generation: u64,
     last_topology_signature: Option<u64>,
-    frame_history: VecDeque<(u64, u64)>,
+    frame_history: VecDeque<FrameRecord>,
+    damage: Option<u32>,
+    damage_sequence: u64,
+    damage_history: VecDeque<DamageRecord>,
     held_keys: HashSet<u8>,
     held_buttons: HashSet<u8>,
     clipboard_window: Window,
     clipboard_content: Option<Vec<u8>>,
+    capture_calls: Cell<u64>,
 }
 
 impl Actor {
@@ -304,7 +396,35 @@ impl Actor {
             .check()
             .map_err(|error| ControllerError::x11("create clipboard window", error))?;
 
-        let extensions = probe_extensions(&connection)?;
+        let mut extensions = probe_extensions(&connection)?;
+        let damage = if extensions.get("damage") == Some(&true) {
+            let initialized = (|| -> Result<u32> {
+                connection
+                    .damage_query_version(1, 1)
+                    .map_err(|error| ControllerError::x11("query Damage version", error))?
+                    .reply()
+                    .map_err(|error| ControllerError::x11("query Damage version", error))?;
+                let id = connection
+                    .generate_id()
+                    .map_err(|error| ControllerError::x11("allocate Damage object", error))?;
+                connection
+                    .damage_create(id, screen.root, ReportLevel::RAW_RECTANGLES)
+                    .map_err(|error| ControllerError::x11("create Damage object", error))?
+                    .check()
+                    .map_err(|error| ControllerError::x11("create Damage object", error))?;
+                Ok(id)
+            })();
+            match initialized {
+                Ok(id) => Some(id),
+                Err(error) => {
+                    warn!(%error, "DAMAGE advertised but could not be initialized; using capture polling");
+                    extensions.insert("damage".to_owned(), false);
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let ewmh =
             property_u32(&connection, screen.root, atoms._NET_SUPPORTING_WM_CHECK)?.is_some();
         let monitors = query_monitors(&connection, screen.root, &screen, &extensions);
@@ -352,16 +472,21 @@ impl Actor {
             allowlist,
             emergency_stop,
             window_refs: HashMap::new(),
+            observed_windows: HashSet::new(),
             ref_xids: HashMap::new(),
             next_window_ref: 1,
             frame_id: 0,
             desktop_generation: 1,
             last_topology_signature: None,
             frame_history: VecDeque::new(),
+            damage,
+            damage_sequence: 0,
+            damage_history: VecDeque::new(),
             held_keys: HashSet::new(),
             held_buttons: HashSet::new(),
             clipboard_window,
             clipboard_content: None,
+            capture_calls: Cell::new(0),
         })
     }
 
@@ -380,6 +505,9 @@ impl Actor {
             }
         }
         self.release_held_input();
+        if let Some(damage) = self.damage {
+            let _ = self.connection.damage_destroy(damage);
+        }
         let _ = self.connection.destroy_window(self.clipboard_window);
         let _ = self.connection.flush();
     }
@@ -398,6 +526,25 @@ impl Actor {
             Operation::TypeText(request) => self.type_text(request).map(Response::Action),
             Operation::WindowAction(request) => self.window_action(request).map(Response::Action),
             Operation::Wait(request) => self.wait_for(request).map(Response::Wait),
+            Operation::ValidateStateGuard {
+                guard,
+                require_frame,
+                include_current_pointer,
+                positions,
+            } => {
+                let positions = positions.iter().collect::<Vec<_>>();
+                self.validate_guard(&guard, require_frame, include_current_pointer, &positions)
+                    .map(|()| Response::Unit)
+            }
+            Operation::ValidateWindowAllowed(window_ref) => self
+                .resolve_window(&window_ref)
+                .and_then(|window| self.ensure_window_allowed(&window))
+                .map(|()| Response::Unit),
+            Operation::ReleaseInput => {
+                self.release_held_input();
+                Ok(Response::Unit)
+            }
+            Operation::CaptureCount => Ok(Response::U64(self.capture_calls.get())),
         };
         if result.is_err() {
             self.release_held_input();
@@ -454,6 +601,17 @@ impl Actor {
     }
 
     fn window_info(&mut self, xid: Window) -> Result<WindowInfo> {
+        if self.observed_windows.insert(xid) {
+            self.connection
+                .change_window_attributes(
+                    xid,
+                    &ChangeWindowAttributesAux::new()
+                        .event_mask(EventMask::PROPERTY_CHANGE | EventMask::STRUCTURE_NOTIFY),
+                )
+                .map_err(|error| ControllerError::x11("subscribe to window events", error))?
+                .check()
+                .map_err(|error| ControllerError::x11("subscribe to window events", error))?;
+        }
         let attributes = self
             .connection
             .get_window_attributes(xid)
@@ -526,15 +684,151 @@ impl Actor {
     }
 
     fn observe(&mut self, request: ObserveRequest) -> Result<Observation> {
+        self.process_pending_events()?;
         let window_list = self.window_list()?;
         let bounds = self.resolve_observe_target(&request.target)?;
-        let (rgb, png) = self.capture(bounds)?;
+        let requested_delivery = request.delivery.clone();
+        let mut base_frame_id = None;
+        let (delivery, complete, patches, images, signature) = match requested_delivery {
+            ObservationDelivery::Full => {
+                let (rgb, png) = self.capture(bounds)?;
+                let mut signature_bytes = rgb;
+                signature_bytes.extend_from_slice(&self.desktop_generation.to_ne_bytes());
+                (
+                    ObservationDelivery::Full,
+                    true,
+                    vec![ImagePatch {
+                        bounds,
+                        image_index: 0,
+                    }],
+                    vec![png],
+                    xxh3_64(&signature_bytes),
+                )
+            }
+            ObservationDelivery::Delta { since_frame_id } => {
+                let base = self
+                    .frame_history
+                    .iter()
+                    .find(|frame| frame.frame_id == since_frame_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        ControllerError::new(
+                            ErrorCode::StaleFrame,
+                            format!("frame {since_frame_id} is not in the 64-frame history"),
+                        )
+                        .retryable(true)
+                    })?;
+                base_frame_id = Some(since_frame_id);
+                if base.target != request.target {
+                    return Err(ControllerError::new(
+                        ErrorCode::StaleFrame,
+                        "delta target does not match the base frame target",
+                    )
+                    .retryable(true));
+                }
+                if self.damage.is_none() {
+                    let (rgb, png) = self.capture(bounds)?;
+                    let mut signature_bytes = rgb;
+                    signature_bytes.extend_from_slice(&self.desktop_generation.to_ne_bytes());
+                    let signature = xxh3_64(&signature_bytes);
+                    if base.desktop_generation != self.desktop_generation
+                        || base.bounds != bounds
+                        || base.signature != signature
+                    {
+                        (
+                            ObservationDelivery::Full,
+                            true,
+                            vec![ImagePatch {
+                                bounds,
+                                image_index: 0,
+                            }],
+                            vec![png],
+                            signature,
+                        )
+                    } else {
+                        (
+                            ObservationDelivery::Delta { since_frame_id },
+                            false,
+                            Vec::new(),
+                            Vec::new(),
+                            signature,
+                        )
+                    }
+                } else {
+                    let journal_expired = self.damage_history.front().is_some_and(|record| {
+                        record.sequence > base.damage_sequence.saturating_add(1)
+                            && self.damage_sequence > base.damage_sequence
+                    });
+                    if journal_expired {
+                        return Err(ControllerError::new(
+                            ErrorCode::StaleFrame,
+                            "damage history for the base frame has expired",
+                        )
+                        .retryable(true));
+                    }
+                    let damage = self
+                        .damage_history
+                        .iter()
+                        .filter(|record| record.sequence > base.damage_sequence)
+                        .copied()
+                        .collect::<Vec<_>>();
+                    let force_full = base.desktop_generation != self.desktop_generation
+                        || base.bounds != bounds
+                        || damage.iter().any(|record| record.topology);
+                    let mut changed = damage
+                        .iter()
+                        .filter_map(|record| intersect_geometry(record.bounds, bounds))
+                        .collect::<Vec<_>>();
+                    coalesce_rectangles(&mut changed);
+                    let inefficient = delta_should_use_full(&changed, bounds);
+                    if force_full || inefficient {
+                        let (rgb, png) = self.capture(bounds)?;
+                        let mut signature_bytes = rgb;
+                        signature_bytes.extend_from_slice(&self.desktop_generation.to_ne_bytes());
+                        (
+                            ObservationDelivery::Full,
+                            true,
+                            vec![ImagePatch {
+                                bounds,
+                                image_index: 0,
+                            }],
+                            vec![png],
+                            xxh3_64(&signature_bytes),
+                        )
+                    } else {
+                        let mut patches = Vec::with_capacity(changed.len());
+                        let mut images = Vec::with_capacity(changed.len());
+                        for patch_bounds in changed {
+                            let (_, png) = self.capture(patch_bounds)?;
+                            let image_index = images.len();
+                            images.push(png);
+                            patches.push(ImagePatch {
+                                bounds: patch_bounds,
+                                image_index,
+                            });
+                        }
+                        (
+                            ObservationDelivery::Delta { since_frame_id },
+                            false,
+                            patches,
+                            images,
+                            self.damage_sequence ^ self.desktop_generation.rotate_left(32),
+                        )
+                    }
+                }
+            }
+        };
+
         let pointer = self.pointer_position()?;
         self.frame_id = self.frame_id.saturating_add(1);
-        let mut signature_bytes = rgb;
-        signature_bytes.extend_from_slice(&self.desktop_generation.to_ne_bytes());
-        let signature = xxh3_64(&signature_bytes);
-        self.frame_history.push_back((self.frame_id, signature));
+        self.frame_history.push_back(FrameRecord {
+            frame_id: self.frame_id,
+            target: request.target,
+            bounds,
+            desktop_generation: self.desktop_generation,
+            signature,
+            damage_sequence: self.damage_sequence,
+        });
         while self.frame_history.len() > FRAME_HISTORY_SIZE {
             self.frame_history.pop_front();
         }
@@ -551,7 +845,11 @@ impl Actor {
                     Vec::new()
                 },
             },
-            png,
+            delivery,
+            base_frame_id,
+            complete,
+            patches,
+            images,
             signature,
         })
     }
@@ -589,6 +887,8 @@ impl Actor {
     }
 
     fn capture(&self, bounds: Geometry) -> Result<(Vec<u8>, Vec<u8>)> {
+        self.capture_calls
+            .set(self.capture_calls.get().saturating_add(1));
         let x = i16::try_from(bounds.x).map_err(|_| {
             ControllerError::new(
                 ErrorCode::InvalidInput,
@@ -725,17 +1025,153 @@ impl Actor {
         Ok(())
     }
 
-    fn action_baseline(&mut self, after: Option<&ObserveAfter>) -> Result<Option<Observation>> {
+    fn validate_guard(
+        &mut self,
+        guard: &StateGuard,
+        require_frame: bool,
+        include_current_pointer: bool,
+        positions: &[&Position],
+    ) -> Result<()> {
+        if guard.prevalidated {
+            return Ok(());
+        }
+        self.process_pending_events()?;
+        let windows = self.window_list()?;
+        if let Some(expected) = &guard.expected_active_window
+            && windows.active_window.as_deref() != Some(expected.as_str())
+        {
+            return Err(ControllerError::new(
+                ErrorCode::PreconditionFailed,
+                "the active window changed since the action was planned",
+            )
+            .retryable(true)
+            .with_details(serde_json::json!({
+                "expected_active_window": expected,
+                "active_window": windows.active_window,
+            })));
+        }
+        let Some(frame_id) = guard.frame_id else {
+            if require_frame {
+                return Err(ControllerError::new(
+                    ErrorCode::PreconditionFailed,
+                    "this targeted action requires guard.frame_id",
+                )
+                .retryable(true));
+            }
+            return Ok(());
+        };
+        let frame = self
+            .frame_history
+            .iter()
+            .find(|frame| frame.frame_id == frame_id)
+            .cloned()
+            .ok_or_else(|| {
+                ControllerError::new(
+                    ErrorCode::StaleFrame,
+                    format!("frame {frame_id} is not in the 64-frame history"),
+                )
+                .retryable(true)
+            })?;
+        if frame.desktop_generation != self.desktop_generation {
+            return Err(ControllerError::new(
+                ErrorCode::PreconditionFailed,
+                "desktop topology changed since the guarded frame",
+            )
+            .retryable(true));
+        }
+        if self.damage_history.front().is_some_and(|record| {
+            record.sequence > frame.damage_sequence.saturating_add(1)
+                && self.damage_sequence > frame.damage_sequence
+        }) {
+            return Err(ControllerError::new(
+                ErrorCode::StaleFrame,
+                "damage history for the guarded frame has expired",
+            )
+            .retryable(true));
+        }
+        if self
+            .damage_history
+            .iter()
+            .filter(|record| record.sequence > frame.damage_sequence)
+            .any(|record| {
+                record.topology || intersect_geometry(record.bounds, frame.bounds).is_some()
+            })
+        {
+            return Err(ControllerError::new(
+                ErrorCode::PreconditionFailed,
+                "the guarded pixels changed before the action",
+            )
+            .retryable(true));
+        }
+        if self.damage.is_none() {
+            let (rgb, _) = self.capture(frame.bounds)?;
+            let mut signature_bytes = rgb;
+            signature_bytes.extend_from_slice(&self.desktop_generation.to_ne_bytes());
+            if xxh3_64(&signature_bytes) != frame.signature {
+                return Err(ControllerError::new(
+                    ErrorCode::PreconditionFailed,
+                    "the guarded pixels changed before the action",
+                )
+                .retryable(true));
+            }
+        }
+        let pointer_position = if include_current_pointer {
+            let pointer = self.pointer_position()?;
+            Some((pointer.x, pointer.y))
+        } else {
+            None
+        };
+        for resolved in positions
+            .iter()
+            .map(|position| self.resolve_position(position))
+            .chain(pointer_position.into_iter().map(Ok))
+        {
+            let (x, y) = resolved?;
+            if intersect_geometry(
+                Geometry {
+                    x,
+                    y,
+                    width: 1,
+                    height: 1,
+                },
+                frame.bounds,
+            )
+            .is_none()
+            {
+                return Err(ControllerError::new(
+                    ErrorCode::PreconditionFailed,
+                    "the guarded frame does not cover the action target",
+                )
+                .retryable(true));
+            }
+        }
+        Ok(())
+    }
+
+    fn action_baseline(&mut self, after: Option<&ObserveAfter>) -> Result<ActionBaseline> {
         self.ensure_mutation_allowed()?;
-        after
-            .map(|_| self.observe(ObserveRequest::default()))
-            .transpose()
+        self.process_pending_events()?;
+        let damage_sequence = self.damage_sequence;
+        let observation = after
+            .filter(|after| self.damage.is_none() || matches!(after.delivery, AfterDelivery::Delta))
+            .map(|after| {
+                self.observe(ObserveRequest {
+                    target: after.target.clone(),
+                    include_windows: after.include_windows,
+                    delivery: ObservationDelivery::Full,
+                })
+            })
+            .transpose()?;
+        Ok(ActionBaseline {
+            observation,
+            damage_sequence,
+        })
     }
 
     fn finish_action(
         &mut self,
         after: Option<&ObserveAfter>,
-        baseline: Option<&Observation>,
+        baseline: &ActionBaseline,
         warnings: Vec<String>,
     ) -> Result<ActionResult> {
         let Some(after) = after else {
@@ -758,7 +1194,7 @@ impl Actor {
     fn settle(
         &mut self,
         after: &ObserveAfter,
-        baseline: Option<&Observation>,
+        baseline: &ActionBaseline,
     ) -> Result<(Observation, bool)> {
         if after.quiet_ms > after.timeout_ms {
             return Err(ControllerError::new(
@@ -769,8 +1205,51 @@ impl Actor {
         let started = Instant::now();
         let timeout = Duration::from_millis(after.timeout_ms);
         let quiet = Duration::from_millis(after.quiet_ms);
-        let baseline_signature = baseline.map(|value| value.signature);
-        let mut latest = self.observe(ObserveRequest::default())?;
+
+        if self.damage.is_some() {
+            let mut last_sequence = baseline.damage_sequence;
+            let mut change_seen = !after.require_change;
+            let mut quiet_since = Instant::now();
+            let settled = loop {
+                self.process_pending_events()?;
+                if self.damage_sequence != last_sequence {
+                    last_sequence = self.damage_sequence;
+                    quiet_since = Instant::now();
+                    change_seen = true;
+                }
+                if change_seen && quiet_since.elapsed() >= quiet {
+                    break true;
+                }
+                if started.elapsed() >= timeout {
+                    break false;
+                }
+                let wake_at = (quiet_since + quiet).min(started + timeout);
+                self.wait_for_x11_event_until(wake_at)?;
+            };
+            let delivery =
+                match after.delivery {
+                    AfterDelivery::Full => ObservationDelivery::Full,
+                    AfterDelivery::Delta => baseline.observation.as_ref().map_or(
+                        ObservationDelivery::Full,
+                        |observation| ObservationDelivery::Delta {
+                            since_frame_id: observation.metadata.frame_id,
+                        },
+                    ),
+                };
+            let observation = self.observe(ObserveRequest {
+                target: after.target.clone(),
+                include_windows: after.include_windows,
+                delivery,
+            })?;
+            return Ok((observation, settled));
+        }
+
+        let baseline_signature = baseline.observation.as_ref().map(|value| value.signature);
+        let mut latest = self.observe(ObserveRequest {
+            target: after.target.clone(),
+            include_windows: after.include_windows,
+            delivery: ObservationDelivery::Full,
+        })?;
         let mut change_seen = !after.require_change
             || baseline_signature.is_none_or(|signature| signature != latest.signature);
         let mut quiet_since = Instant::now();
@@ -784,7 +1263,11 @@ impl Actor {
             }
             thread::sleep(POLL_INTERVAL.min(timeout.saturating_sub(started.elapsed())));
             self.process_pending_events()?;
-            let next = self.observe(ObserveRequest::default())?;
+            let next = self.observe(ObserveRequest {
+                target: after.target.clone(),
+                include_windows: after.include_windows,
+                delivery: ObservationDelivery::Full,
+            })?;
             if next.signature != last_signature {
                 quiet_since = Instant::now();
                 change_seen = true;
@@ -795,6 +1278,7 @@ impl Actor {
     }
 
     fn focus(&mut self, request: FocusWindowRequest) -> Result<ActionResult> {
+        self.validate_guard(&request.guard, false, false, &[])?;
         let baseline = self.action_baseline(request.observe_after.as_ref())?;
         let window = self.resolve_window(&request.window_ref)?;
         self.ensure_window_allowed(&window)?;
@@ -815,15 +1299,16 @@ impl Actor {
         self.connection
             .flush()
             .map_err(|error| ControllerError::x11("flush focus", error))?;
-        self.finish_action(
-            request.observe_after.as_ref(),
-            baseline.as_ref(),
-            Vec::new(),
-        )
+        self.finish_action(request.observe_after.as_ref(), &baseline, Vec::new())
     }
 
     fn move_pointer(&mut self, request: MovePointerRequest) -> Result<ActionResult> {
         self.ensure_xtest()?;
+        let guarded = matches!(
+            request.position,
+            Position::Window { .. } | Position::WindowRelative { .. }
+        );
+        self.validate_guard(&request.guard, guarded, false, &[&request.position])?;
         let baseline = self.action_baseline(request.observe_after.as_ref())?;
         self.rate_limiter.consume(1)?;
         let (x, y) = self.resolve_position(&request.position)?;
@@ -831,15 +1316,16 @@ impl Actor {
         self.connection
             .flush()
             .map_err(|error| ControllerError::x11("flush pointer move", error))?;
-        self.finish_action(
-            request.observe_after.as_ref(),
-            baseline.as_ref(),
-            Vec::new(),
-        )
+        self.finish_action(request.observe_after.as_ref(), &baseline, Vec::new())
     }
 
     fn click(&mut self, request: ClickRequest) -> Result<ActionResult> {
         self.ensure_xtest()?;
+        let positions = request
+            .position
+            .as_ref()
+            .map_or_else(Vec::new, |position| vec![position]);
+        self.validate_guard(&request.guard, true, request.position.is_none(), &positions)?;
         if request.button == 0 || request.count == 0 || request.count > 10 {
             return Err(ControllerError::new(
                 ErrorCode::InvalidInput,
@@ -867,15 +1353,12 @@ impl Actor {
         self.connection
             .flush()
             .map_err(|error| ControllerError::x11("flush click", error))?;
-        self.finish_action(
-            request.observe_after.as_ref(),
-            baseline.as_ref(),
-            Vec::new(),
-        )
+        self.finish_action(request.observe_after.as_ref(), &baseline, Vec::new())
     }
 
     fn drag(&mut self, request: DragRequest) -> Result<ActionResult> {
         self.ensure_xtest()?;
+        self.validate_guard(&request.guard, true, false, &[&request.from, &request.to])?;
         if request.button == 0 || request.steps == 0 || request.steps > 100 {
             return Err(ControllerError::new(
                 ErrorCode::InvalidInput,
@@ -910,15 +1393,21 @@ impl Actor {
         self.connection
             .flush()
             .map_err(|error| ControllerError::x11("flush drag", error))?;
-        self.finish_action(
-            request.observe_after.as_ref(),
-            baseline.as_ref(),
-            Vec::new(),
-        )
+        self.finish_action(request.observe_after.as_ref(), &baseline, Vec::new())
     }
 
     fn scroll(&mut self, request: ScrollRequest) -> Result<ActionResult> {
         self.ensure_xtest()?;
+        let positions = request
+            .position
+            .as_ref()
+            .map_or_else(Vec::new, |position| vec![position]);
+        self.validate_guard(
+            &request.guard,
+            request.position.is_some(),
+            false,
+            &positions,
+        )?;
         let ticks = request
             .dx
             .unsigned_abs()
@@ -944,11 +1433,7 @@ impl Actor {
         self.connection
             .flush()
             .map_err(|error| ControllerError::x11("flush scroll", error))?;
-        self.finish_action(
-            request.observe_after.as_ref(),
-            baseline.as_ref(),
-            Vec::new(),
-        )
+        self.finish_action(request.observe_after.as_ref(), &baseline, Vec::new())
     }
 
     fn scroll_axis(&self, amount: i32, negative_button: u8, positive_button: u8) -> Result<()> {
@@ -966,6 +1451,7 @@ impl Actor {
 
     fn key(&mut self, request: KeyRequest) -> Result<ActionResult> {
         self.ensure_xtest()?;
+        self.validate_guard(&request.guard, false, false, &[])?;
         self.ensure_focused_allowed()?;
         if request.keys.is_empty() || request.keys.len() > 16 {
             return Err(ControllerError::new(
@@ -1018,15 +1504,12 @@ impl Actor {
         self.connection
             .flush()
             .map_err(|error| ControllerError::x11("flush keyboard input", error))?;
-        self.finish_action(
-            request.observe_after.as_ref(),
-            baseline.as_ref(),
-            Vec::new(),
-        )
+        self.finish_action(request.observe_after.as_ref(), &baseline, Vec::new())
     }
 
     fn type_text(&mut self, request: TypeTextRequest) -> Result<ActionResult> {
         self.ensure_xtest()?;
+        self.validate_guard(&request.guard, false, false, &[])?;
         self.ensure_focused_allowed()?;
         if request.text.len() > 1_048_576 {
             return Err(ControllerError::new(
@@ -1066,7 +1549,7 @@ impl Actor {
                 .flush()
                 .map_err(|error| ControllerError::x11("flush text input", error))?;
         }
-        self.finish_action(request.observe_after.as_ref(), baseline.as_ref(), warnings)
+        self.finish_action(request.observe_after.as_ref(), &baseline, warnings)
     }
 
     fn type_stroke(&self, keyboard: &KeyboardMap, stroke: KeyStroke) -> Result<()> {
@@ -1093,6 +1576,7 @@ impl Actor {
     }
 
     fn window_action(&mut self, request: WindowActionRequest) -> Result<ActionResult> {
+        self.validate_guard(&request.guard, false, false, &[])?;
         let baseline = self.action_baseline(request.observe_after.as_ref())?;
         let window = self.resolve_window(&request.window_ref)?;
         self.ensure_window_allowed(&window)?;
@@ -1128,11 +1612,7 @@ impl Actor {
         self.connection
             .flush()
             .map_err(|error| ControllerError::x11("flush window action", error))?;
-        self.finish_action(
-            request.observe_after.as_ref(),
-            baseline.as_ref(),
-            Vec::new(),
-        )
+        self.finish_action(request.observe_after.as_ref(), &baseline, Vec::new())
     }
 
     fn move_resize_window(
@@ -1461,24 +1941,100 @@ impl Actor {
         }
         let deadline = Instant::now() + Duration::from_millis(request.timeout_ms);
         match request.condition {
-            WaitCondition::Change { since_frame_id } => {
+            WaitCondition::Change {
+                since_frame_id,
+                target,
+            } => {
+                let observe_request = ObserveRequest {
+                    target: target.clone(),
+                    include_windows: true,
+                    delivery: ObservationDelivery::Full,
+                };
+                if self.damage.is_some() {
+                    self.process_pending_events()?;
+                    let bounds = self.resolve_observe_target(&target)?;
+                    let baseline_sequence = if let Some(frame_id) = since_frame_id {
+                        let frame = self
+                            .frame_history
+                            .iter()
+                            .find(|frame| frame.frame_id == frame_id)
+                            .ok_or_else(|| {
+                                ControllerError::new(
+                                    ErrorCode::StaleFrame,
+                                    format!("frame {frame_id} is not in the 64-frame history"),
+                                )
+                                .retryable(true)
+                            })?;
+                        if frame.target != target {
+                            return Err(ControllerError::new(
+                                ErrorCode::StaleFrame,
+                                "frame_changed target does not match the base frame target",
+                            )
+                            .retryable(true));
+                        }
+                        frame.damage_sequence
+                    } else {
+                        self.damage_sequence
+                    };
+                    loop {
+                        self.process_pending_events()?;
+                        if self.damage_history.front().is_some_and(|record| {
+                            record.sequence > baseline_sequence.saturating_add(1)
+                                && self.damage_sequence > baseline_sequence
+                        }) {
+                            return Err(ControllerError::new(
+                                ErrorCode::StaleFrame,
+                                "damage history for the waited frame has expired",
+                            )
+                            .retryable(true));
+                        }
+                        let changed = self
+                            .damage_history
+                            .iter()
+                            .filter(|record| record.sequence > baseline_sequence)
+                            .any(|record| {
+                                record.topology
+                                    || intersect_geometry(record.bounds, bounds).is_some()
+                            });
+                        if changed {
+                            let observation = request
+                                .observe
+                                .then(|| self.observe(observe_request.clone()))
+                                .transpose()?;
+                            return Ok(WaitResult {
+                                matched: true,
+                                window: None,
+                                observation,
+                            });
+                        }
+                        self.wait_tick(deadline)?;
+                    }
+                }
                 let baseline_signature = if let Some(frame_id) = since_frame_id {
-                    self.frame_history
+                    let frame = self
+                        .frame_history
                         .iter()
-                        .find_map(|(known_id, signature)| {
-                            (*known_id == frame_id).then_some(*signature)
-                        })
+                        .find(|frame| frame.frame_id == frame_id)
                         .ok_or_else(|| {
                             ControllerError::new(
                                 ErrorCode::StaleFrame,
                                 format!("frame {frame_id} is not in the 64-frame history"),
                             )
-                        })?
+                            .retryable(true)
+                        })?;
+                    if frame.target != target {
+                        return Err(ControllerError::new(
+                            ErrorCode::StaleFrame,
+                            "frame_changed target does not match the base frame target",
+                        )
+                        .retryable(true));
+                    }
+                    frame.signature
                 } else {
-                    self.observe(ObserveRequest::default())?.signature
+                    self.observe(observe_request.clone())?.signature
                 };
                 loop {
-                    let observation = self.observe(ObserveRequest::default())?;
+                    let observation = self.observe(observe_request.clone())?;
                     if observation.signature != baseline_signature {
                         return Ok(WaitResult {
                             matched: true,
@@ -1486,18 +2042,66 @@ impl Actor {
                             observation: request.observe.then_some(observation),
                         });
                     }
-                    self.wait_tick(deadline)?;
+                    self.poll_tick(deadline)?;
                 }
             }
-            WaitCondition::Idle { quiet_ms } => {
+            WaitCondition::Idle { quiet_ms, target } => {
                 if quiet_ms > request.timeout_ms {
                     return Err(ControllerError::new(
                         ErrorCode::InvalidInput,
-                        "idle quiet_ms cannot exceed timeout_ms",
+                        "frame_idle quiet_ms cannot exceed timeout_ms",
                     ));
                 }
                 let quiet = Duration::from_millis(quiet_ms);
-                let mut observation = self.observe(ObserveRequest::default())?;
+                let observe_request = ObserveRequest {
+                    target: target.clone(),
+                    include_windows: true,
+                    delivery: ObservationDelivery::Full,
+                };
+                if self.damage.is_some() {
+                    self.process_pending_events()?;
+                    let mut bounds = self.resolve_observe_target(&target)?;
+                    let mut sequence = self.damage_sequence;
+                    let mut quiet_since = Instant::now();
+                    loop {
+                        self.process_pending_events()?;
+                        let relevant = self
+                            .damage_history
+                            .iter()
+                            .filter(|record| record.sequence > sequence)
+                            .any(|record| {
+                                record.topology
+                                    || intersect_geometry(record.bounds, bounds).is_some()
+                            });
+                        if relevant {
+                            sequence = self.damage_sequence;
+                            bounds = self.resolve_observe_target(&target)?;
+                            quiet_since = Instant::now();
+                        } else {
+                            sequence = self.damage_sequence;
+                        }
+                        if quiet_since.elapsed() >= quiet {
+                            let observation = request
+                                .observe
+                                .then(|| self.observe(observe_request.clone()))
+                                .transpose()?;
+                            return Ok(WaitResult {
+                                matched: true,
+                                window: None,
+                                observation,
+                            });
+                        }
+                        if Instant::now() >= deadline {
+                            return Err(ControllerError::new(
+                                ErrorCode::Timeout,
+                                "wait condition timed out",
+                            )
+                            .retryable(true));
+                        }
+                        self.wait_for_x11_event_until((quiet_since + quiet).min(deadline))?;
+                    }
+                }
+                let mut observation = self.observe(observe_request.clone())?;
                 let mut signature = observation.signature;
                 let mut quiet_since = Instant::now();
                 loop {
@@ -1508,8 +2112,8 @@ impl Actor {
                             observation: request.observe.then_some(observation),
                         });
                     }
-                    self.wait_tick(deadline)?;
-                    let next = self.observe(ObserveRequest::default())?;
+                    self.poll_tick(deadline)?;
+                    let next = self.observe(observe_request.clone())?;
                     if next.signature != signature {
                         quiet_since = Instant::now();
                         signature = next.signature;
@@ -1533,6 +2137,38 @@ impl Actor {
                         window: Some(window),
                         observation,
                     });
+                }
+                self.wait_tick(deadline)?;
+            },
+            WaitCondition::WindowState {
+                window_ref,
+                mapped,
+                active,
+                title_contains,
+            } => loop {
+                let list = self.window_list()?;
+                let is_active = list.active_window.as_deref() == Some(window_ref.as_str());
+                if let Some(window) = list
+                    .windows
+                    .into_iter()
+                    .find(|window| window.window_ref == window_ref)
+                {
+                    let matches = mapped.is_none_or(|wanted| window.mapped == wanted)
+                        && active.is_none_or(|wanted| is_active == wanted)
+                        && title_contains.as_ref().is_none_or(|wanted| {
+                            window.title.to_lowercase().contains(&wanted.to_lowercase())
+                        });
+                    if matches {
+                        let observation = request
+                            .observe
+                            .then(|| self.observe(ObserveRequest::default()))
+                            .transpose()?;
+                        return Ok(WaitResult {
+                            matched: true,
+                            window: Some(window),
+                            observation,
+                        });
+                    }
                 }
                 self.wait_tick(deadline)?;
             },
@@ -1581,6 +2217,34 @@ impl Actor {
     }
 
     fn wait_tick(&mut self, deadline: Instant) -> Result<()> {
+        if Instant::now() >= deadline {
+            return Err(
+                ControllerError::new(ErrorCode::Timeout, "wait condition timed out")
+                    .retryable(true),
+            );
+        }
+        self.wait_for_x11_event_until(deadline)
+    }
+
+    fn wait_for_x11_event_until(&mut self, deadline: Instant) -> Result<()> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if !remaining.is_zero() {
+            let timeout = Timespec::try_from(remaining).map_err(|error| {
+                ControllerError::new(
+                    ErrorCode::Internal,
+                    format!("convert X11 wait deadline: {error}"),
+                )
+            })?;
+            {
+                let mut descriptors = [PollFd::new(self.connection.stream(), PollFlags::IN)];
+                poll(&mut descriptors, Some(&timeout))
+                    .map_err(|error| ControllerError::x11("wait for X11 event", error))?;
+            }
+        }
+        self.process_pending_events()
+    }
+
+    fn poll_tick(&mut self, deadline: Instant) -> Result<()> {
         let now = Instant::now();
         if now >= deadline {
             return Err(
@@ -1777,6 +2441,9 @@ impl Actor {
                         self.clipboard_content = None;
                         return Ok(false);
                     }
+                    Event::DamageNotify(event) if Some(event.damage) == self.damage => {
+                        self.record_damage_event(event)?;
+                    }
                     _ => {}
                 }
             }
@@ -1798,14 +2465,77 @@ impl Actor {
                 Event::SelectionClear(event) if event.selection == self.atoms.CLIPBOARD => {
                     self.clipboard_content = None;
                 }
+                Event::DamageNotify(event) if Some(event.damage) == self.damage => {
+                    self.record_damage_event(event)?;
+                }
                 Event::DestroyNotify(event) => {
                     self.window_refs.remove(&event.window);
+                    self.observed_windows.remove(&event.window);
+                    self.record_topology_change();
                 }
-                Event::MappingNotify(_) => debug!("X11 keyboard mapping changed"),
+                Event::CreateNotify(_)
+                | Event::MapNotify(_)
+                | Event::UnmapNotify(_)
+                | Event::ConfigureNotify(_)
+                | Event::ReparentNotify(_)
+                | Event::RandrNotify(_)
+                | Event::RandrScreenChangeNotify(_)
+                | Event::PropertyNotify(_) => self.record_topology_change(),
+                Event::MappingNotify(_) => {
+                    debug!("X11 keyboard mapping changed");
+                    self.record_topology_change();
+                }
                 _ => {}
             }
         }
         Ok(())
+    }
+
+    fn record_damage_event(&mut self, event: x11rb::protocol::damage::NotifyEvent) -> Result<()> {
+        self.record_damage(
+            Geometry {
+                x: i32::from(event.area.x),
+                y: i32::from(event.area.y),
+                width: u32::from(event.area.width),
+                height: u32::from(event.area.height),
+            },
+            false,
+        );
+        if let Some(damage) = self.damage {
+            self.connection
+                .damage_subtract(damage, NONE, NONE)
+                .map_err(|error| ControllerError::x11("subtract Damage region", error))?
+                .check()
+                .map_err(|error| ControllerError::x11("subtract Damage region", error))?;
+        }
+        Ok(())
+    }
+
+    fn record_topology_change(&mut self) {
+        self.record_damage(
+            Geometry {
+                x: 0,
+                y: 0,
+                width: u32::from(self.capabilities.screen.width),
+                height: u32::from(self.capabilities.screen.height),
+            },
+            true,
+        );
+    }
+
+    fn record_damage(&mut self, bounds: Geometry, topology: bool) {
+        if bounds.width == 0 || bounds.height == 0 {
+            return;
+        }
+        self.damage_sequence = self.damage_sequence.saturating_add(1);
+        self.damage_history.push_back(DamageRecord {
+            sequence: self.damage_sequence,
+            bounds,
+            topology,
+        });
+        while self.damage_history.len() > DAMAGE_HISTORY_SIZE {
+            self.damage_history.pop_front();
+        }
     }
 
     fn serve_selection_request(&self, request: SelectionRequestEvent) -> Result<()> {
@@ -1987,6 +2717,76 @@ fn property_u32_list(
     Ok(reply.value32().map(Iterator::collect))
 }
 
+fn geometry_area(geometry: &Geometry) -> u64 {
+    u64::from(geometry.width).saturating_mul(u64::from(geometry.height))
+}
+
+fn intersect_geometry(left: Geometry, right: Geometry) -> Option<Geometry> {
+    let x1 = i64::from(left.x).max(i64::from(right.x));
+    let y1 = i64::from(left.y).max(i64::from(right.y));
+    let x2 = (i64::from(left.x) + i64::from(left.width))
+        .min(i64::from(right.x) + i64::from(right.width));
+    let y2 = (i64::from(left.y) + i64::from(left.height))
+        .min(i64::from(right.y) + i64::from(right.height));
+    (x2 > x1 && y2 > y1).then(|| Geometry {
+        x: i32::try_from(x1).unwrap_or(i32::MAX),
+        y: i32::try_from(y1).unwrap_or(i32::MAX),
+        width: u32::try_from(x2 - x1).unwrap_or(u32::MAX),
+        height: u32::try_from(y2 - y1).unwrap_or(u32::MAX),
+    })
+}
+
+fn rectangles_touch(left: Geometry, right: Geometry) -> bool {
+    let left_edge = i64::from(left.x) + i64::from(left.width);
+    let left_bottom = i64::from(left.y) + i64::from(left.height);
+    let right_edge = i64::from(right.x) + i64::from(right.width);
+    let right_bottom = i64::from(right.y) + i64::from(right.height);
+    i64::from(left.x) <= right_edge
+        && i64::from(right.x) <= left_edge
+        && i64::from(left.y) <= right_bottom
+        && i64::from(right.y) <= left_bottom
+}
+
+fn union_geometry(left: Geometry, right: Geometry) -> Geometry {
+    let x1 = i64::from(left.x).min(i64::from(right.x));
+    let y1 = i64::from(left.y).min(i64::from(right.y));
+    let x2 = (i64::from(left.x) + i64::from(left.width))
+        .max(i64::from(right.x) + i64::from(right.width));
+    let y2 = (i64::from(left.y) + i64::from(left.height))
+        .max(i64::from(right.y) + i64::from(right.height));
+    Geometry {
+        x: i32::try_from(x1).unwrap_or(i32::MIN),
+        y: i32::try_from(y1).unwrap_or(i32::MIN),
+        width: u32::try_from(x2 - x1).unwrap_or(u32::MAX),
+        height: u32::try_from(y2 - y1).unwrap_or(u32::MAX),
+    }
+}
+
+fn delta_should_use_full(rectangles: &[Geometry], bounds: Geometry) -> bool {
+    let changed_area = rectangles.iter().map(geometry_area).sum::<u64>();
+    let full_area = geometry_area(&bounds);
+    rectangles.len() > MAX_DELTA_PATCHES
+        || changed_area.saturating_mul(100) >= full_area.saturating_mul(FULL_FRAME_AREA_PERCENT)
+}
+
+fn coalesce_rectangles(rectangles: &mut Vec<Geometry>) {
+    let mut index = 0;
+    while index < rectangles.len() {
+        let mut candidate = index + 1;
+        while candidate < rectangles.len() {
+            if rectangles_touch(rectangles[index], rectangles[candidate]) {
+                rectangles[index] = union_geometry(rectangles[index], rectangles[candidate]);
+                rectangles.swap_remove(candidate);
+                candidate = index + 1;
+            } else {
+                candidate += 1;
+            }
+        }
+        index += 1;
+    }
+    rectangles.sort_by_key(|geometry| (geometry.y, geometry.x));
+}
+
 fn clip_geometry(geometry: Geometry, screen_width: u32, screen_height: u32) -> Result<Geometry> {
     if geometry.width == 0 || geometry.height == 0 {
         return Err(ControllerError::new(
@@ -2073,6 +2873,123 @@ mod tests {
                 width: 20,
                 height: 40,
             }
+        );
+    }
+
+    #[test]
+    fn coalesces_overlapping_and_edge_touching_rectangles() {
+        let mut rectangles = vec![
+            Geometry {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 10,
+            },
+            Geometry {
+                x: 10,
+                y: 0,
+                width: 5,
+                height: 10,
+            },
+            Geometry {
+                x: 4,
+                y: 4,
+                width: 2,
+                height: 20,
+            },
+        ];
+        coalesce_rectangles(&mut rectangles);
+        assert_eq!(
+            rectangles,
+            vec![Geometry {
+                x: 0,
+                y: 0,
+                width: 15,
+                height: 24,
+            }]
+        );
+    }
+
+    #[test]
+    fn keeps_separated_rectangles_as_patches() {
+        let mut rectangles = vec![
+            Geometry {
+                x: 20,
+                y: 20,
+                width: 2,
+                height: 2,
+            },
+            Geometry {
+                x: 0,
+                y: 0,
+                width: 2,
+                height: 2,
+            },
+        ];
+        coalesce_rectangles(&mut rectangles);
+        assert_eq!(rectangles.len(), 2);
+        assert_eq!(rectangles[0].x, 0);
+    }
+
+    #[test]
+    fn delta_falls_back_above_patch_limit_or_at_area_threshold() {
+        let bounds = Geometry {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 100,
+        };
+        let sixteen = (0..16)
+            .map(|index| Geometry {
+                x: index * 2,
+                y: 0,
+                width: 1,
+                height: 1,
+            })
+            .collect::<Vec<_>>();
+        assert!(!delta_should_use_full(&sixteen, bounds));
+        let mut seventeen = sixteen;
+        seventeen.push(Geometry {
+            x: 40,
+            y: 0,
+            width: 1,
+            height: 1,
+        });
+        assert!(delta_should_use_full(&seventeen, bounds));
+        assert!(delta_should_use_full(
+            &[Geometry {
+                x: 0,
+                y: 0,
+                width: 60,
+                height: 100,
+            }],
+            bounds
+        ));
+    }
+
+    #[test]
+    fn intersects_and_clips_damage_to_capture_bounds() {
+        assert_eq!(
+            intersect_geometry(
+                Geometry {
+                    x: -5,
+                    y: 5,
+                    width: 20,
+                    height: 20,
+                },
+                Geometry {
+                    x: 0,
+                    y: 0,
+                    width: 10,
+                    height: 10,
+                },
+            ),
+            Some(Geometry {
+                x: 0,
+                y: 5,
+                width: 10,
+                height: 5,
+            })
         );
     }
 

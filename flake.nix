@@ -11,21 +11,51 @@
       packages = forAllSystems (system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
+          atspiForTests = pkgs.at-spi2-core.overrideAttrs (old: {
+            mesonFlags =
+              builtins.filter
+                (flag: !(pkgs.lib.hasPrefix "-Ddbus_daemon=" flag))
+                old.mesonFlags
+              ++ [ "-Ddbus_daemon=${pkgs.dbus}/bin/dbus-daemon" ];
+          });
           package = pkgs.rustPlatform.buildRustPackage {
             pname = "x11-mcp";
-            version = "0.1.0";
+            version = "0.2.0";
             src = self;
             cargoLock.lockFile = ./Cargo.lock;
-            nativeCheckInputs = [ pkgs.xorg-server pkgs.openbox ];
-            preCheck = ''
-              export DISPLAY=:99
-              export X11_MCP_RUN_X11_TESTS=1
-              Xvfb :99 -screen 0 800x600x24 -nolisten tcp &
-              xvfb_pid=$!
-              openbox >/dev/null 2>&1 &
-              openbox_pid=$!
-              trap 'kill "$openbox_pid" "$xvfb_pid" 2>/dev/null || true' EXIT
-              sleep 1
+            nativeCheckInputs = [
+              atspiForTests
+              pkgs.dbus
+              pkgs.openbox
+              pkgs.xorg-server
+              pkgs.zenity
+            ];
+            checkPhase = ''
+              runHook preCheck
+              dbus-run-session \
+                --config-file=${pkgs.dbus}/share/dbus-1/session.conf \
+                -- bash -euo pipefail -c '
+                export ATSPI_DBUS_IMPLEMENTATION=dbus-daemon
+                export DISPLAY=:99
+                export GTK_A11Y=atspi
+                unset AT_SPI_BUS_ADDRESS
+                export NO_AT_BRIDGE=0
+                export X11_MCP_RUN_ATSPI_TESTS=1
+                export X11_MCP_RUN_X11_TESTS=1
+                mkdir -p /tmp/.X11-unix
+                chmod 1777 /tmp/.X11-unix
+                Xvfb :99 -screen 0 800x600x24 -nolisten tcp &
+                xvfb_pid=$!
+                sleep 0.5
+                DISPLAY=:99 openbox >/dev/null 2>&1 &
+                openbox_pid=$!
+                ${atspiForTests}/libexec/at-spi-bus-launcher --launch-immediately --a11y=1 --screen-reader=1 &
+                atspi_pid=$!
+                trap "kill $atspi_pid $openbox_pid $xvfb_pid 2>/dev/null || true" EXIT
+                sleep 1
+                cargo test --workspace -- --test-threads=1
+              '
+              runHook postCheck
             '';
             meta = {
               description = "Native X11 control server for Model Context Protocol clients";
@@ -52,12 +82,15 @@
       });
 
       devShells = forAllSystems (system:
-        let pkgs = nixpkgs.legacyPackages.${system};
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
         in {
           default = pkgs.mkShell {
             packages = with pkgs; [
+              at-spi2-core
               cargo
               clippy
+              dbus
               openbox
               rust-analyzer
               rustc
@@ -65,6 +98,7 @@
               xauth
               xorg-server
               xterm
+              zenity
             ];
             shellHook = ''
               echo "x11-mcp development shell"

@@ -26,6 +26,15 @@ pub trait DesktopController: Send + Sync {
     async fn type_text(&self, request: TypeTextRequest) -> Result<ActionResult>;
     async fn window_action(&self, request: WindowActionRequest) -> Result<ActionResult>;
     async fn wait_for(&self, request: WaitRequest) -> Result<WaitResult>;
+    async fn validate_state_guard(
+        &self,
+        guard: StateGuard,
+        require_frame: bool,
+        include_current_pointer: bool,
+        positions: Vec<Position>,
+    ) -> Result<()>;
+    async fn validate_window_allowed(&self, window_ref: String) -> Result<()>;
+    async fn release_input(&self) -> Result<()>;
 }
 
 /// Connects a controller actor to one X11 display.

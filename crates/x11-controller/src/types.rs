@@ -98,7 +98,7 @@ pub struct WindowList {
     pub windows: Vec<WindowInfo>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(
     tag = "coordinate_space",
     rename_all = "snake_case",
@@ -110,7 +110,7 @@ pub enum Position {
     WindowRelative { window_ref: String, x: f64, y: f64 },
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ObserveTarget {
     #[default]
@@ -126,11 +126,22 @@ pub enum ObserveTarget {
     },
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ObservationDelivery {
+    #[default]
+    Full,
+    Delta {
+        since_frame_id: u64,
+    },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct ObserveRequest {
     pub target: ObserveTarget,
     pub include_windows: bool,
+    pub delivery: ObservationDelivery,
 }
 
 impl Default for ObserveRequest {
@@ -138,6 +149,7 @@ impl Default for ObserveRequest {
         Self {
             target: ObserveTarget::Desktop,
             include_windows: true,
+            delivery: ObservationDelivery::Full,
         }
     }
 }
@@ -160,15 +172,34 @@ pub struct ObservationMetadata {
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ImagePatch {
+    pub bounds: Geometry,
+    pub image_index: usize,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct Observation {
     #[serde(flatten)]
     pub metadata: ObservationMetadata,
+    pub delivery: ObservationDelivery,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_frame_id: Option<u64>,
+    pub complete: bool,
+    pub patches: Vec<ImagePatch>,
     #[serde(skip)]
     #[schemars(skip)]
-    pub png: Vec<u8>,
+    pub images: Vec<Vec<u8>>,
     #[serde(skip)]
     #[schemars(skip)]
     pub signature: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AfterDelivery {
+    #[default]
+    Full,
+    Delta,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -177,6 +208,9 @@ pub struct ObserveAfter {
     pub quiet_ms: u64,
     pub timeout_ms: u64,
     pub require_change: bool,
+    pub target: ObserveTarget,
+    pub include_windows: bool,
+    pub delivery: AfterDelivery,
 }
 
 impl Default for ObserveAfter {
@@ -185,14 +219,33 @@ impl Default for ObserveAfter {
             quiet_ms: 150,
             timeout_ms: 3_000,
             require_change: false,
+            target: ObserveTarget::Desktop,
+            include_windows: true,
+            delivery: AfterDelivery::Full,
         }
     }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
+pub struct StateGuard {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frame_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accessibility_generation: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_active_window: Option<String>,
+    #[serde(skip)]
+    #[schemars(skip)]
+    #[doc(hidden)]
+    pub prevalidated: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
 pub struct FocusWindowRequest {
     pub window_ref: String,
+    pub guard: StateGuard,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub observe_after: Option<ObserveAfter>,
 }
@@ -201,6 +254,8 @@ pub struct FocusWindowRequest {
 #[serde(deny_unknown_fields)]
 pub struct MovePointerRequest {
     pub position: Position,
+    #[serde(default)]
+    pub guard: StateGuard,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observe_after: Option<ObserveAfter>,
 }
@@ -212,6 +267,7 @@ pub struct ClickRequest {
     pub position: Option<Position>,
     pub button: u8,
     pub count: u8,
+    pub guard: StateGuard,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub observe_after: Option<ObserveAfter>,
 }
@@ -222,6 +278,7 @@ impl Default for ClickRequest {
             position: None,
             button: 1,
             count: 1,
+            guard: StateGuard::default(),
             observe_after: None,
         }
     }
@@ -235,6 +292,7 @@ pub struct DragRequest {
     pub button: u8,
     pub duration_ms: u64,
     pub steps: u16,
+    pub guard: StateGuard,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub observe_after: Option<ObserveAfter>,
 }
@@ -247,6 +305,7 @@ impl Default for DragRequest {
             button: 1,
             duration_ms: 300,
             steps: 10,
+            guard: StateGuard::default(),
             observe_after: None,
         }
     }
@@ -259,6 +318,7 @@ pub struct ScrollRequest {
     pub position: Option<Position>,
     pub dx: i32,
     pub dy: i32,
+    pub guard: StateGuard,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub observe_after: Option<ObserveAfter>,
 }
@@ -277,6 +337,7 @@ pub enum KeyMode {
 pub struct KeyRequest {
     pub keys: Vec<String>,
     pub mode: KeyMode,
+    pub guard: StateGuard,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub observe_after: Option<ObserveAfter>,
 }
@@ -295,6 +356,7 @@ pub enum TextMethod {
 pub struct TypeTextRequest {
     pub text: String,
     pub method: TextMethod,
+    pub guard: StateGuard,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub observe_after: Option<ObserveAfter>,
 }
@@ -326,11 +388,12 @@ pub enum WindowAction {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
 pub struct WindowActionRequest {
     pub window_ref: String,
     #[serde(flatten)]
     pub action: WindowAction,
+    #[serde(default)]
+    pub guard: StateGuard,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observe_after: Option<ObserveAfter>,
 }
@@ -341,13 +404,23 @@ pub enum WaitCondition {
     Change {
         #[serde(default)]
         since_frame_id: Option<u64>,
+        #[serde(default)]
+        target: ObserveTarget,
     },
     Idle {
         #[serde(default = "default_quiet_ms")]
         quiet_ms: u64,
+        #[serde(default)]
+        target: ObserveTarget,
     },
     Window {
         selector: WindowSelector,
+    },
+    WindowState {
+        window_ref: String,
+        mapped: Option<bool>,
+        active: Option<bool>,
+        title_contains: Option<String>,
     },
     Focus {
         window_ref: String,
