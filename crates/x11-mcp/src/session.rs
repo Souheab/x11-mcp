@@ -23,6 +23,11 @@ use x11_controller::{
     WindowSelector,
 };
 
+use crate::applications::{
+    AppList, ApplicationCapabilities, ApplicationLauncher, LaunchAppRequest, LaunchAppResult,
+    ListAppsRequest,
+};
+
 const ACCESSIBILITY_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const WAIT_POLL: Duration = Duration::from_millis(50);
 const MAX_BATCH_STEPS: usize = 64;
@@ -33,6 +38,7 @@ pub struct SessionCapabilities {
     #[serde(flatten)]
     pub x11: Capabilities,
     pub accessibility: AccessibilityInfo,
+    pub applications: ApplicationCapabilities,
     pub limits: SessionLimits,
 }
 
@@ -46,6 +52,7 @@ pub struct SessionLimits {
 #[derive(Clone)]
 pub struct DesktopSession {
     controller: Arc<dyn DesktopController>,
+    applications: ApplicationLauncher,
     accessibility: Arc<RwLock<Option<Arc<AccessibilityController>>>>,
     accessibility_reason: Arc<RwLock<Option<String>>>,
     accessibility_mode: AccessibilityMode,
@@ -55,10 +62,12 @@ pub struct DesktopSession {
 impl DesktopSession {
     pub async fn new(
         controller: Arc<dyn DesktopController>,
+        applications: ApplicationLauncher,
         mode: AccessibilityMode,
     ) -> Result<Self, ControllerError> {
         let session = Self {
             controller,
+            applications,
             accessibility: Arc::new(RwLock::new(None)),
             accessibility_reason: Arc::new(RwLock::new(None)),
             accessibility_mode: mode.clone(),
@@ -92,6 +101,7 @@ impl DesktopSession {
         Ok(SessionCapabilities {
             x11,
             accessibility,
+            applications: self.applications.capabilities(),
             limits: SessionLimits {
                 frame_history: 64,
                 max_batch_steps: MAX_BATCH_STEPS,
@@ -109,6 +119,18 @@ impl DesktopSession {
         request: ListWindowsRequest,
     ) -> Result<x11_controller::WindowList, ControllerError> {
         self.controller.list_windows(request).await
+    }
+
+    pub async fn list_apps(&self, request: ListAppsRequest) -> Result<AppList, ControllerError> {
+        self.applications.list_apps(request).await
+    }
+
+    pub async fn launch_app(
+        &self,
+        request: LaunchAppRequest,
+    ) -> Result<LaunchAppResult, ControllerError> {
+        let _guard = self.mutation.lock().await;
+        self.applications.launch_app(request).await
     }
 
     pub async fn focus_window(
@@ -493,6 +515,9 @@ impl DesktopSession {
                 request.observe_after = None;
                 serde_value(self.execute_accessibility_action(&request).await?)
             }
+            BatchStep::LaunchApp { request } => {
+                serde_value(self.applications.launch_app(request).await?)
+            }
             BatchStep::WaitFor { mut request } => {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 request.timeout_ms = request
@@ -747,6 +772,7 @@ pub enum BatchStep {
     TypeText { request: TypeTextRequest },
     WindowAction { request: WindowActionRequest },
     AccessibilityAction { request: AccessibilityActionRequest },
+    LaunchApp { request: LaunchAppRequest },
     WaitFor { request: SessionWaitRequest },
 }
 

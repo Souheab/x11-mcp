@@ -15,7 +15,10 @@ use x11_controller::{
     MovePointerRequest, ObserveRequest, ScrollRequest, TypeTextRequest, WindowActionRequest,
 };
 
-use crate::session::{BatchRequest, DesktopSession, SessionWaitRequest};
+use crate::{
+    applications::{LaunchAppRequest, ListAppsRequest},
+    session::{BatchRequest, DesktopSession, SessionWaitRequest},
+};
 
 #[derive(Clone)]
 pub struct X11McpServer {
@@ -80,6 +83,40 @@ impl X11McpServer {
         Parameters(request): Parameters<ListWindowsRequest>,
     ) -> std::result::Result<CallToolResult, ErrorData> {
         Ok(to_tool_result(self.session.list_windows(request).await))
+    }
+
+    #[tool(
+        name = "x11.list_apps",
+        description = "List visible launchable desktop applications by localized name and stable desktop-entry ID",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn list_apps(
+        &self,
+        Parameters(request): Parameters<ListAppsRequest>,
+    ) -> std::result::Result<CallToolResult, ErrorData> {
+        Ok(to_tool_result(self.session.list_apps(request).await))
+    }
+
+    #[tool(
+        name = "x11.launch_app",
+        description = "Launch a visible desktop application by exact desktop-entry ID on the selected X11 display",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn launch_app(
+        &self,
+        Parameters(request): Parameters<LaunchAppRequest>,
+    ) -> std::result::Result<CallToolResult, ErrorData> {
+        Ok(to_tool_result(self.session.launch_app(request).await))
     }
 
     #[tool(
@@ -221,7 +258,7 @@ impl X11McpServer {
 
     #[tool(
         name = "x11.batch",
-        description = "Execute 1-64 guarded X11, semantic, and wait steps without mutation interleaving",
+        description = "Execute 1-64 guarded application, X11, semantic, and wait steps without mutation interleaving",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -320,13 +357,16 @@ impl X11McpServer {
 
 #[tool_handler(
     name = "x11-mcp",
-    version = "0.2.0",
+    version = "0.3.0",
     instructions = r#"Control only the explicitly selected X11 display. Treat every observation as
 time-sensitive and verify the result of every mutation.
 
 Recommended workflow:
 1. Call x11.get_capabilities, then x11.list_windows. Use stable window_ref values and verify the
-   intended window by title, class, mapping state, geometry, and active-window state.
+   intended window by title, class, mapping state, geometry, and active-window state. To start an
+   application, call x11.list_apps, select an exact app_id, call x11.launch_app, then use
+   x11.wait_for to verify its window; put launch_app and wait_for in x11.batch when they must not
+   interleave with another mutation.
 2. Prefer semantic control when accessibility.available is true. Take an
    x11.accessibility_snapshot rooted at the relevant window or element, select by role/name/state/
    supported action, and mutate with x11.accessibility_action using the snapshot's
@@ -356,9 +396,10 @@ Error handling and safety:
   replanned; do not blindly repeat it. Refresh both pixel and semantic state when both are used.
 - If accessibility is unavailable, use visible X11 observations and coordinate actions. Do not
   infer hidden or occluded content from screenshots.
-- On timeout, observe current state before retrying. On batch failure, account for completed steps.
-- Avoid destructive input or window actions unless required by the user's request. After each
-  action or batch, confirm the intended postcondition before continuing."#
+- On timeout, observe current state before retrying. On batch failure, account for completed steps,
+  including an application that may already have launched.
+- Avoid application launches, destructive input, or window actions unless required by the user's
+  request. After each action or batch, confirm the intended postcondition before continuing."#
 )]
 impl ServerHandler for X11McpServer {}
 

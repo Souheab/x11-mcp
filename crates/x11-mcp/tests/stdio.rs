@@ -1,4 +1,4 @@
-use std::process::Stdio;
+use std::{fs, process::Stdio};
 
 use serde_json::{Value, json};
 use tokio::{
@@ -18,6 +18,23 @@ async fn initializes_and_serves_tools_over_stdio() {
         return;
     }
     let display = std::env::var("DISPLAY").expect("DISPLAY must be set by the test harness");
+    let app_data = tempfile::tempdir().expect("temporary application data");
+    let applications = app_data.path().join("applications");
+    fs::create_dir_all(&applications).expect("create applications directory");
+    let desktop_entry = concat!(
+        "[Desktop Entry]\n",
+        "Type=Application\n",
+        "Name=x11-mcp Launcher Test\n",
+        "Exec=zenity --info --title=\"x11-mcp launcher test\" ",
+        "--text=\"Launched through desktop entry\"\n",
+        "Terminal=false\n",
+        "DBusActivatable=true\n"
+    );
+    fs::write(
+        applications.join("x11-mcp-launcher-test.desktop"),
+        desktop_entry,
+    )
+    .expect("write launcher desktop entry");
     let mut child = Command::new(env!("CARGO_BIN_EXE_x11-mcp"))
         .args([
             "--display",
@@ -27,6 +44,7 @@ async fn initializes_and_serves_tools_over_stdio() {
             "disabled",
         ])
         .stdin(Stdio::piped())
+        .env("XDG_DATA_HOME", app_data.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -44,18 +62,19 @@ async fn initializes_and_serves_tools_over_stdio() {
             "params": {
                 "protocolVersion": "2025-11-25",
                 "capabilities": {},
-                "clientInfo": {"name": "x11-mcp-test", "version": "0.2.0"}
+                "clientInfo": {"name": "x11-mcp-test", "version": "0.3.0"}
             }
         }),
     )
     .await;
     assert_eq!(initialized["result"]["serverInfo"]["name"], "x11-mcp");
-    assert_eq!(initialized["result"]["serverInfo"]["version"], "0.2.0");
+    assert_eq!(initialized["result"]["serverInfo"]["version"], "0.3.0");
     let instructions = initialized["result"]["instructions"]
         .as_str()
         .expect("server instructions");
     for required_guidance in [
         "x11.get_capabilities",
+        "x11.list_apps",
         "accessibility_generation",
         "frame_id",
         "expected_active_window",
@@ -85,7 +104,7 @@ async fn initializes_and_serves_tools_over_stdio() {
     let tools = tools["result"]["tools"]
         .as_array()
         .expect("tools/list array");
-    assert_eq!(tools.len(), 15);
+    assert_eq!(tools.len(), 17);
     let names = tools
         .iter()
         .filter_map(|tool| tool["name"].as_str())
@@ -93,6 +112,8 @@ async fn initializes_and_serves_tools_over_stdio() {
     for expected in [
         "x11.observe",
         "x11.batch",
+        "x11.list_apps",
+        "x11.launch_app",
         "x11.accessibility_snapshot",
         "x11.accessibility_action",
         "x11.wait_for",
@@ -100,11 +121,28 @@ async fn initializes_and_serves_tools_over_stdio() {
         assert!(names.contains(expected), "missing tool {expected}");
     }
     assert!(tools.iter().all(|tool| tool["annotations"].is_object()));
+    let list_apps_tool = tools
+        .iter()
+        .find(|tool| tool["name"] == "x11.list_apps")
+        .expect("list_apps tool");
+    assert!(
+        list_apps_tool["inputSchema"]["properties"]["query"].is_object(),
+        "list_apps query schema missing"
+    );
+    let launch_app_tool = tools
+        .iter()
+        .find(|tool| tool["name"] == "x11.launch_app")
+        .expect("launch_app tool");
+    assert_eq!(
+        launch_app_tool["inputSchema"]["required"],
+        json!(["app_id"])
+    );
     let schemas = serde_json::to_string(tools).expect("serialize tool schemas");
     assert!(schemas.contains("frame_id"));
     assert!(schemas.contains("accessibility_generation"));
     assert!(schemas.contains("since_frame_id"));
-
+    assert!(schemas.contains("app_id"));
+    assert!(schemas.contains("launch_app"));
     let capabilities = exchange(
         &mut stdin,
         &mut stdout,
@@ -125,6 +163,116 @@ async fn initializes_and_serves_tools_over_stdio() {
         capabilities["result"]["structuredContent"]["accessibility"]["available"],
         false
     );
+
+    assert_eq!(
+        capabilities["result"]["structuredContent"]["applications"]["desktop_entry_launch"],
+        true
+    );
+    assert_eq!(
+        capabilities["result"]["structuredContent"]["applications"]["terminal_entries_excluded"],
+        true
+    );
+    assert_eq!(
+        capabilities["result"]["structuredContent"]["applications"]["allowlist_enabled"],
+        false
+    );
+
+    let apps = exchange(
+        &mut stdin,
+        &mut stdout,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 40,
+            "method": "tools/call",
+            "params": {
+                "name": "x11.list_apps",
+                "arguments": {"query": "launcher test"}
+            }
+        }),
+    )
+    .await;
+    assert_eq!(apps["result"]["isError"], false, "{apps:?}");
+    assert_eq!(
+        apps["result"]["structuredContent"]["apps"][0]["app_id"],
+        "x11-mcp-launcher-test"
+    );
+
+    let launched = exchange(
+        &mut stdin,
+        &mut stdout,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 41,
+            "method": "tools/call",
+            "params": {
+                "name": "x11.batch",
+                "arguments": {
+                    "timeout_ms": 5000,
+                    "steps": [
+                        {
+                            "step": "launch_app",
+                            "request": {"app_id": "x11-mcp-launcher-test"}
+                        },
+                        {
+                            "step": "wait_for",
+                            "request": {
+                                "condition": {
+                                    "condition": "window_matched",
+                                    "selector": {"title_contains": "x11-mcp launcher test"}
+                                },
+                                "timeout_ms": 4000,
+                                "observe": false
+                            }
+                        }
+                    ]
+                }
+            }
+        }),
+    )
+    .await;
+    assert_eq!(launched["result"]["isError"], false, "{launched:?}");
+    assert_eq!(launched["result"]["structuredContent"]["ok"], true);
+    let launch_steps = launched["result"]["structuredContent"]["steps"]
+        .as_array()
+        .expect("launch batch steps");
+    assert_eq!(launch_steps.len(), 2);
+    assert!(
+        launch_steps[0]["value"]["pid"]
+            .as_u64()
+            .is_some_and(|pid| pid > 0)
+    );
+    assert!(
+        launch_steps[1]["value"]["window"]["mapped"].is_boolean(),
+        "wait result missing mapped window state"
+    );
+    assert!(
+        launch_steps[1]["value"]["window"]["title"]
+            .as_str()
+            .is_some_and(|title| title.contains("x11-mcp launcher test"))
+    );
+    let launched_window = launch_steps[1]["value"]["window"]["window_ref"]
+        .as_str()
+        .expect("launched window reference");
+
+    let close = exchange(
+        &mut stdin,
+        &mut stdout,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "method": "tools/call",
+            "params": {
+                "name": "x11.window_action",
+                "arguments": {
+                    "window_ref": launched_window,
+                    "action": "close",
+                    "force": false
+                }
+            }
+        }),
+    )
+    .await;
+    assert_eq!(close["result"]["isError"], false, "{close:?}");
 
     let idle = exchange(
         &mut stdin,
@@ -915,12 +1063,12 @@ async fn initialize(stdin: &mut ChildStdin, stdout: &mut BufReader<ChildStdout>)
             "params": {
                 "protocolVersion": "2025-11-25",
                 "capabilities": {},
-                "clientInfo": {"name": "x11-mcp-test", "version": "0.2.0"}
+                "clientInfo": {"name": "x11-mcp-test", "version": "0.3.0"}
             }
         }),
     )
     .await;
-    assert_eq!(initialized["result"]["serverInfo"]["version"], "0.2.0");
+    assert_eq!(initialized["result"]["serverInfo"]["version"], "0.3.0");
     send(
         stdin,
         json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),

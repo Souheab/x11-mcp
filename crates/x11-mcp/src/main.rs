@@ -1,3 +1,4 @@
+mod applications;
 mod safety;
 mod server;
 mod session;
@@ -18,7 +19,12 @@ use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 use x11_controller::{ControllerConfig, DesktopController};
 
-use crate::{safety::validate_target_display, server::X11McpServer, session::DesktopSession};
+use crate::{
+    applications::{ApplicationConfig, ApplicationLauncher},
+    safety::validate_target_display,
+    server::X11McpServer,
+    session::DesktopSession,
+};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum AccessibilityModeArg {
@@ -58,6 +64,10 @@ struct Cli {
     /// Glob matching an allowed `WM_CLASS` instance or class. Repeatable.
     #[arg(long = "allow-window-class")]
     allow_window_classes: Vec<String>,
+
+    /// Glob matching an allowed desktop-entry application ID. Repeatable.
+    #[arg(long = "allow-app")]
+    allow_apps: Vec<String>,
 
     /// Maximum synthesized XTEST events accepted in a one-second burst.
     #[arg(long, default_value_t = 200)]
@@ -129,6 +139,15 @@ async fn run(cli: Cli) -> Result<()> {
     }
     let emergency_stop = Arc::new(AtomicBool::new(false));
     install_emergency_stop(emergency_stop.clone())?;
+    let application_launcher = ApplicationLauncher::new(
+        ApplicationConfig {
+            display: cli.display.clone(),
+            allow_apps: cli.allow_apps,
+        },
+        emergency_stop.clone(),
+    )
+    .map_err(anyhow::Error::msg)?;
+
     let controller = x11_controller::connect(
         ControllerConfig {
             display: cli.display.clone(),
@@ -142,7 +161,7 @@ async fn run(cli: Cli) -> Result<()> {
     let capabilities = controller.capabilities().await?;
     info!(display = %capabilities.display, "connected to X11 display; starting MCP stdio");
     let session = Arc::new(
-        DesktopSession::new(controller, cli.accessibility.into())
+        DesktopSession::new(controller, application_launcher, cli.accessibility.into())
             .await
             .map_err(anyhow::Error::msg)?,
     );
@@ -165,7 +184,7 @@ fn install_emergency_stop(stop: Arc<AtomicBool>) -> Result<()> {
         tokio::spawn(async move {
             if signal.recv().await.is_some() {
                 stop.store(true, Ordering::SeqCst);
-                warn!("SIGUSR1 received: emergency stop latched; restart to re-enable input");
+                warn!("SIGUSR1 received: emergency stop latched; restart to re-enable mutations");
             }
         });
     }

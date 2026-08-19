@@ -3,7 +3,7 @@ members = ["crates/atspi-controller", "crates/x11-controller", "crates/x11-mcp"]
 resolver = "2"
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
@@ -15,6 +15,7 @@ atspi = { version = "0.30", default-features = false, features = ["connection", 
 base64 = "0.22"
 clap = { version = "4.5", features = ["derive", "env"] }
 futures-lite = { version = "2.6", default-features = false }
+freedesktop-desktop-entry = { version = "0.8.1", default-features = false }
 globset = "0.4"
 png = "0.18"
 rmcp = { version = "2.2.0", features = ["server", "schemars", "transport-io"] }
@@ -23,6 +24,7 @@ schemars = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
+tempfile = "3.20"
 tokio = { version = "1.47", features = ["io-util", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

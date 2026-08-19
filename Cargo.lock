@@ -261,7 +261,7 @@ dependencies = [
 
 [[package]]
 name = "atspi-controller"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "atspi",
  "futures-lite",
@@ -322,6 +322,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1f7dc094d718f2e1c1559ad110e27eeaae14a5465d3d56dd6dbd793079fbd530"
 dependencies = [
  "memchr",
+ "regex-automata",
  "serde_core",
 ]
 
@@ -573,6 +574,20 @@ checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
 dependencies = [
  "crc32fast",
  "miniz_oxide",
+]
+
+[[package]]
+name = "freedesktop-desktop-entry"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "28273c5c6b97a5f07724f6652f064c0c7f637f9aa5e7c09c83bc3bc4ad4ea245"
+dependencies = [
+ "bstr",
+ "log",
+ "memchr",
+ "thiserror",
+ "unicase",
+ "xdg",
 ]
 
 [[package]]
@@ -1450,6 +1465,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "unicase"
+version = "2.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dbc4bc3a9f746d862c45cb89d705aa10f187bb96c76001afab07a0d35ce60142"
+
+[[package]]
 name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1609,7 +1630,7 @@ dependencies = [
 
 [[package]]
 name = "x11-controller"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "globset",
@@ -1627,16 +1648,19 @@ dependencies = [
 
 [[package]]
 name = "x11-mcp"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "atspi-controller",
  "base64",
  "clap",
+ "freedesktop-desktop-entry",
+ "globset",
  "rmcp",
  "schemars",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -1660,6 +1684,12 @@ name = "x11rb-protocol"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ea6fc2961e4ef194dcbfe56bb845534d0dc8098940c7e5c012a258bfec6701bd"
+
+[[package]]
+name = "xdg"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2fb433233f2df9344722454bc7e96465c9d03bff9d77c248f9e7523fe79585b5"
 
 [[package]]
 name = "xxhash-rust"
