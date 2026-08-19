@@ -321,7 +321,44 @@ impl X11McpServer {
 #[tool_handler(
     name = "x11-mcp",
     version = "0.2.0",
-    instructions = "Controls one explicitly selected X11 display. Prefer isolated Xvfb or Xephyr displays, use stable window_ref values, and request observe_after when an action needs a settled screenshot."
+    instructions = r#"Control only the explicitly selected X11 display. Treat every observation as
+time-sensitive and verify the result of every mutation.
+
+Recommended workflow:
+1. Call x11.get_capabilities, then x11.list_windows. Use stable window_ref values and verify the
+   intended window by title, class, mapping state, geometry, and active-window state.
+2. Prefer semantic control when accessibility.available is true. Take an
+   x11.accessibility_snapshot rooted at the relevant window or element, select by role/name/state/
+   supported action, and mutate with x11.accessibility_action using the snapshot's
+   accessibility_generation. Element references are session-local.
+3. Otherwise call x11.observe on the smallest desktop/window/region target that contains the
+   planned coordinates. Use its frame_id for clicks, drags, positioned scrolling, clicks at the
+   current pointer, and window/window-relative pointer movement. Add expected_active_window when
+   focus matters. Never reuse a guard after relevant pixels, topology, bounds, or focus changed.
+4. Before keyboard input, focus and verify the target window. Prefer x11.type_text for text and
+   x11.key for shortcuts or explicit key state.
+5. Use observe_after to settle and verify mutations. Use x11.wait_for instead of fixed sleeps;
+   scope frame waits to the relevant window or region because animated desktops may never become
+   globally idle.
+6. Use x11.batch for 1-64 dependent mutation/wait steps that must not interleave. A batch has one
+   initial guard, one deadline, and one final observation; it is fail-fast and has no rollback, so
+   inspect failed_step and completed_steps before deciding what remains safe to do.
+
+Observation delivery:
+- Start with a full observation. Request delta delivery only from a compatible recent frame_id.
+- An empty patch list means no visual change. complete=true means replace the prior image with the
+  returned full frame. Otherwise apply patches at their screen-space bounds; image_index is
+  zero-based among the MCP image content blocks in that tool result.
+- On stale_frame or an incompatible delta base, request a new full observation.
+
+Error handling and safety:
+- precondition_failed, stale_frame, and stale_element mean state must be refreshed and the action
+  replanned; do not blindly repeat it. Refresh both pixel and semantic state when both are used.
+- If accessibility is unavailable, use visible X11 observations and coordinate actions. Do not
+  infer hidden or occluded content from screenshots.
+- On timeout, observe current state before retrying. On batch failure, account for completed steps.
+- Avoid destructive input or window actions unless required by the user's request. After each
+  action or batch, confirm the intended postcondition before continuing."#
 )]
 impl ServerHandler for X11McpServer {}
 

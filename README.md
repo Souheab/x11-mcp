@@ -121,6 +121,11 @@ A generic configuration for a local checkout is:
 
 All logs go to stderr. Stdout contains only MCP protocol messages.
 
+During MCP initialization the server supplies clients with an operating playbook. It directs agents
+to discover capabilities and windows first, prefer AT-SPI semantics, guard coordinate actions with
+fresh observations, use scoped event-driven waits, interpret delta patches correctly, batch
+dependent steps, refresh stale state instead of blindly retrying, and verify every mutation.
+
 ## Tools
 
 v0.2 exposes 15 focused tools:

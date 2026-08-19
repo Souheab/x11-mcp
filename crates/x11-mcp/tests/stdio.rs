@@ -51,6 +51,25 @@ async fn initializes_and_serves_tools_over_stdio() {
     .await;
     assert_eq!(initialized["result"]["serverInfo"]["name"], "x11-mcp");
     assert_eq!(initialized["result"]["serverInfo"]["version"], "0.2.0");
+    let instructions = initialized["result"]["instructions"]
+        .as_str()
+        .expect("server instructions");
+    for required_guidance in [
+        "x11.get_capabilities",
+        "accessibility_generation",
+        "frame_id",
+        "expected_active_window",
+        "x11.wait_for",
+        "x11.batch",
+        "complete=true",
+        "precondition_failed",
+        "confirm the intended postcondition",
+    ] {
+        assert!(
+            instructions.contains(required_guidance),
+            "server instructions missing {required_guidance}"
+        );
+    }
     send(
         &mut stdin,
         json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
